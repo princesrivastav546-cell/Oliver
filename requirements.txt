@@ -1,0 +1,4 @@
+python-telegram-bot[job-queue]==20.7
+flask==2.3.3
+psutil==5.9.8
+python-dotenv==1.0.1
