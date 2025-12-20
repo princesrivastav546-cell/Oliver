@@ -13,7 +13,7 @@ from urllib.parse import quote, unquote
 from pathlib import Path
 
 import psutil
-from flask import Flask, request, render_template_string, jsonify, abort
+from flask import Flask, request, render_template_string, jsonify
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -47,11 +47,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-running_processes = {}  # {target_id: {"process": Popen, "log": log_path, "started_at": epoch}}
+running_processes = {}  # {target_id: {"process": Popen, "log": path, "started_at": epoch, "last_alert": epoch}}
+
+# ---------- ALERT/HEALTH SETTINGS (Feature F) ----------
+ENABLE_ALERTS = os.environ.get("ENABLE_ALERTS", "1") == "1"
+HEALTHCHECK_INTERVAL_SEC = int(os.environ.get("HEALTHCHECK_INTERVAL_SEC", "20"))
+ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "180"))
+
+# thresholds (set env vars if you want)
+CPU_ALERT_PERCENT = float(os.environ.get("CPU_ALERT_PERCENT", "85"))
+RAM_ALERT_MB = float(os.environ.get("RAM_ALERT_MB", "350"))
+
 
 # ================= ID HELPERS =================
 def is_user_file_id(tid: str) -> bool:
-    # u<uid>|filename.ext
     return (
         isinstance(tid, str)
         and tid.startswith("u")
@@ -61,7 +70,6 @@ def is_user_file_id(tid: str) -> bool:
     )
 
 def is_repo_id(tid: str) -> bool:
-    # repoName|path/to/file.ext (not user file id)
     return ("|" in tid) and (not is_user_file_id(tid))
 
 def safe_q(s: str) -> str:
@@ -70,7 +78,8 @@ def safe_q(s: str) -> str:
 def safe_status_url(tid: str, key: str) -> str:
     return f"{BASE_URL}/status?script={safe_q(tid)}&key={safe_q(key)}"
 
-# ================= DATA STORE =================
+
+# ================= JSON STORE =================
 def _read_json(path: str, default):
     if not os.path.exists(path):
         return default
@@ -131,19 +140,16 @@ def set_last_run(target_id: str, value: bool):
         data[target_id]["last_run"] = bool(value)
         _write_json(OWNERSHIP_FILE, data)
 
+def get_entry(target_id: str):
+    return load_ownership().get(target_id, {}).get("entry")
+
+
 # ================= PATH RESOLUTION =================
 def resolve_paths(target_id: str):
     """
-    target_id formats:
-    1) user file: u<uid>|filename.py
-       work_dir: scripts/<uid>/
-       env:      scripts/<uid>/.env
-       req:      scripts/<uid>/requirements.txt
-    2) repo: repoName|path/to/file.py
-       work_dir: scripts/<repoName>/
-       env:      scripts/<repoName>/.env
-       req:      scripts/<repoName>/requirements.txt
-    3) legacy: filename.py (scripts/filename.py)
+    user file: u<uid>|filename.py  -> scripts/<uid>/
+    repo: repoName|path/to/file.py -> scripts/<repoName>/
+    legacy: filename.py -> scripts/
     """
     if is_user_file_id(target_id):
         u, filename = target_id.split("|", 1)
@@ -171,7 +177,8 @@ def resolve_paths(target_id: str):
     full_script_path = os.path.join(work_dir, target_id)
     return work_dir, script_path, env_path, req_path, full_script_path
 
-# ================= SECURITY HELPERS =================
+
+# ================= FILE UTILS =================
 def within_dir(base: str, p: str) -> bool:
     base_abs = os.path.abspath(base)
     p_abs = os.path.abspath(p)
@@ -187,7 +194,6 @@ def list_files_safe(work_dir: str, max_files: int = 400):
             break
         if path.is_file():
             rel = str(path.relative_to(base))
-            # block giant/unsafe folders
             if rel.startswith(".git/") or rel.startswith("node_modules/"):
                 continue
             if rel.endswith(".pyc"):
@@ -196,17 +202,9 @@ def list_files_safe(work_dir: str, max_files: int = 400):
     out.sort()
     return out
 
-# ================= COMMAND DETECTION =================
+
+# ================= RUN COMMAND DETECTION =================
 def resolve_run_command(work_dir: str, script_rel: str | None):
-    """
-    Auto-detects best command:
-    - If package.json exists and has scripts.start and (script_rel is None OR script_rel endswith .js):
-        npm start
-    - If script_rel given:
-        by extension: node/bash/python
-    - If script_rel not given:
-        tries common entry files inside work_dir
-    """
     pkg = os.path.join(work_dir, "package.json")
     if os.path.exists(pkg):
         try:
@@ -229,22 +227,17 @@ def resolve_run_command(work_dir: str, script_rel: str | None):
     if script_rel:
         return by_ext(script_rel), script_rel
 
-    # no script provided: pick common entry
-    candidates = [
-        "main.py", "app.py", "server.py", "bot.py",
-        "index.js", "server.js",
-        "start.sh",
-    ]
+    candidates = ["main.py", "app.py", "server.py", "bot.py", "index.js", "server.js", "start.sh"]
     for c in candidates:
         if os.path.exists(os.path.join(work_dir, c)):
             return by_ext(c), c
 
-    # fallback: first runnable file
     for f in list_files_safe(work_dir, max_files=200):
         if f.endswith((".py", ".js", ".sh")):
             return by_ext(f), f
 
     return None, None
+
 
 # ================= PROCESS MANAGEMENT =================
 def build_env(env_path: str):
@@ -269,11 +262,9 @@ def restart_process_background(target_id: str):
         except Exception:
             pass
 
-    # decide command
-    record = load_ownership().get(target_id, {})
-    entry = record.get("entry")  # may be None
+    entry = get_entry(target_id)
+
     if is_repo_id(target_id):
-        # for repo mode, entry can be record["entry"] (relative file)
         cmd, chosen = resolve_run_command(work_dir, entry)
     elif is_user_file_id(target_id):
         cmd, chosen = resolve_run_command(work_dir, script_path)
@@ -284,7 +275,7 @@ def restart_process_background(target_id: str):
         logger.error("No runnable entry found.")
         return
 
-    # save chosen entry for next auto-start (only for repo)
+    # persist chosen for repo
     if is_repo_id(target_id):
         data = load_ownership()
         if target_id in data:
@@ -294,9 +285,8 @@ def restart_process_background(target_id: str):
     os.makedirs(work_dir, exist_ok=True)
     custom_env = build_env(env_path)
 
-    # log file per app
     log_path = os.path.join(UPLOAD_DIR, f"{target_id.replace('|','_')}.log")
-    log_file = open(log_path, "a", encoding="utf-8")  # append keeps history
+    log_file = open(log_path, "a", encoding="utf-8")
 
     try:
         proc = subprocess.Popen(
@@ -307,7 +297,12 @@ def restart_process_background(target_id: str):
             cwd=work_dir,
             preexec_fn=os.setsid,
         )
-        running_processes[target_id] = {"process": proc, "log": log_path, "started_at": time.time()}
+        running_processes[target_id] = {
+            "process": proc,
+            "log": log_path,
+            "started_at": time.time(),
+            "last_alert": 0,
+        }
         set_last_run(target_id, True)
     except Exception as e:
         logger.error(f"Failed to start: {e}")
@@ -332,6 +327,17 @@ def clear_log(target_id: str):
     except Exception:
         pass
 
+def tail_log(target_id: str, lines: int = 50) -> str:
+    log_path = os.path.join(UPLOAD_DIR, f"{target_id.replace('|','_')}.log")
+    if not os.path.exists(log_path):
+        return "(no log file)"
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            data = f.read().splitlines()[-max(10, min(lines, 400)):]
+        return "\n".join(data) if data else "(empty)"
+    except Exception:
+        return "(failed to read log)"
+
 def auto_start_last_run_apps():
     data = load_ownership()
     for tid, meta in data.items():
@@ -340,6 +346,7 @@ def auto_start_last_run_apps():
                 restart_process_background(tid)
             except Exception as e:
                 logger.error(f"Auto-start failed for {tid}: {e}")
+
 
 # ================= DEP INSTALL =================
 async def install_dependencies(work_dir: str, update: Update):
@@ -376,6 +383,7 @@ async def install_dependencies(work_dir: str, update: Update):
         if msg:
             await msg.edit_text(f"❌ Error: {e}")
 
+
 # ================= TELEGRAM DECORATORS =================
 def restricted(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
@@ -394,6 +402,7 @@ def super_admin_only(func):
         return await func(update, context, *args, **kwargs)
     return wrapped
 
+
 # ================= KEYBOARDS =================
 def main_menu_keyboard(uid: int):
     rows = [
@@ -402,7 +411,7 @@ def main_menu_keyboard(uid: int):
         ["🆘 Help"],
     ]
     if uid == ADMIN_ID:
-        rows.insert(2, ["🛠 Admin Panel"])
+        rows.insert(2, ["🛠 Owner Panel"])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 def extras_keyboard():
@@ -411,21 +420,13 @@ def extras_keyboard():
 def git_extras_keyboard():
     return ReplyKeyboardMarkup([["📝 Type Env Vars"], ["📂 Select File to Run", "🔙 Cancel"]], resize_keyboard=True)
 
+
 # ================= FLASK APP =================
 app = Flask(__name__)
 
-HOME_HTML = """
-<!DOCTYPE html><html>
-<head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bot Host</title></head>
-<body style="font-family:sans-serif">
-<h3>🤖 Bot Host is Alive</h3>
-<p>Use Telegram bot to manage apps.</p>
-</body></html>
-"""
-
 @app.route("/")
 def home():
-    return HOME_HTML, 200
+    return "🤖 Bot Host is Alive!", 200
 
 @app.route("/status")
 def status():
@@ -434,7 +435,6 @@ def status():
     if not script:
         return "Specify script", 400
 
-    # secure key required
     real_key = get_app_key(script)
     if not real_key or key != real_key:
         return "⛔ Forbidden", 403
@@ -443,10 +443,9 @@ def status():
         return f"✅ {script} is running.", 200
     return f"❌ {script} is stopped.", 404
 
-# ---------- Logs UI (Feature 2) ----------
+# ---- Logs UI (optional web) ----
 LOGS_HTML = """
-<!DOCTYPE html><html>
-<head>
+<!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Logs</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
@@ -456,8 +455,7 @@ body{margin:0;font-family:sans-serif;background:#0b0d10;color:#e8e8e8}
 .btn{padding:8px 10px;border:0;border-radius:8px;background:#2b90ff;color:#fff;font-weight:700}
 .small{opacity:.75;font-size:12px}
 pre{margin:0;padding:12px;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,monospace;font-size:12px}
-</style>
-</head>
+</style></head>
 <body>
 <div class="header">
   <button class="btn" onclick="loadLogs()">🔄 Refresh</button>
@@ -472,8 +470,7 @@ async function loadLogs(){
   document.getElementById('logbox').textContent = t;
 }
 loadLogs();
-</script>
-</body></html>
+</script></body></html>
 """
 
 @app.route("/logs")
@@ -495,97 +492,9 @@ def logs_api():
     if uid != ADMIN_ID and uid != owner:
         return "⛔ Access Denied", 403
 
-    log_path = os.path.join(UPLOAD_DIR, f"{tid.replace('|','_')}.log")
-    if not os.path.exists(log_path):
-        return "No logs.", 200
+    return tail_log(tid, lines), 200
 
-    try:
-        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
-            data = f.read().splitlines()[-max(50, min(lines, 1000)):]
-        return "\n".join(data) if data else "(empty)", 200
-    except Exception:
-        return "Failed to read logs.", 200
-
-# ---------- File Manager UI (Feature 8) ----------
-FILES_HTML = """
-<!DOCTYPE html><html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Files</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<style>
-body{margin:0;font-family:sans-serif;background:#0b0d10;color:#e8e8e8}
-.header{padding:10px;background:#161a20;position:sticky;top:0}
-input,button{padding:10px;border-radius:10px;border:0}
-button{background:#2b90ff;color:#fff;font-weight:700}
-.list{padding:10px;display:flex;flex-direction:column;gap:8px}
-.item{padding:10px;border-radius:10px;background:#131821;display:flex;justify-content:space-between;gap:10px;align-items:center}
-a{color:#8bd3ff;text-decoration:none;font-weight:700}
-.small{opacity:.75;font-size:12px}
-.row{display:flex;gap:8px;margin-top:8px}
-</style>
-</head>
-<body>
-<div class="header">
-  <div class="small">App: {{tid_plain}}</div>
-  <div class="row">
-    <input id="newname" placeholder="new file e.g. test.py" style="flex:1;background:#0f141d;color:#fff">
-    <button onclick="createFile()">➕ Create</button>
-  </div>
-</div>
-<div class="list" id="list">Loading...</div>
-<script>
-var tg=window.Telegram.WebApp; tg.expand();
-async function loadFiles(){
-  const r = await fetch('/api/files?id={{tid}}&uid={{uid}}');
-  const j = await r.json();
-  if(!j.ok){ document.getElementById('list').textContent=j.message; return; }
-  const div=document.getElementById('list');
-  div.innerHTML='';
-  j.files.forEach(f=>{
-    const el=document.createElement('div');
-    el.className='item';
-    const left=document.createElement('div');
-    left.innerHTML = '<div>'+f+'</div><div class="small">tap to edit</div>';
-    const a=document.createElement('a');
-    a.href = '{{base}}/editor?id={{tid_plain_enc}}&file='+encodeURIComponent(f)+'&uid={{uid}}';
-    a.textContent='✏️ Edit';
-    el.appendChild(left); el.appendChild(a);
-    div.appendChild(el);
-  });
-}
-async function createFile(){
-  const name=document.getElementById('newname').value.trim();
-  if(!name){ tg.showAlert('Enter file name'); return; }
-  const r = await fetch('/api/create_file', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({id:'{{tid_plain}}', uid: {{uid}}, name: name})
-  });
-  const j=await r.json();
-  if(j.ok){ document.getElementById('newname').value=''; loadFiles(); }
-  else tg.showAlert(j.message||'Failed');
-}
-loadFiles();
-</script>
-</body></html>
-"""
-
-@app.route("/files")
-def files_ui():
-    tid = request.args.get("id", "")
-    uid = int(request.args.get("uid", "0"))
-    owner = get_owner(tid)
-    if uid != ADMIN_ID and uid != owner:
-        return "⛔ Access Denied", 403
-    return render_template_string(
-        FILES_HTML,
-        tid=safe_q(tid),
-        tid_plain=tid,
-        tid_plain_enc=safe_q(tid),
-        uid=uid,
-        base=BASE_URL,
-    )
-
+# ---- Files listing API (for your file manager if needed) ----
 @app.route("/api/files")
 def files_api():
     tid = unquote(request.args.get("id", ""))
@@ -598,356 +507,122 @@ def files_api():
     files = list_files_safe(work_dir)
     return jsonify({"ok": True, "files": files})
 
-@app.route("/api/create_file", methods=["POST"])
-def api_create_file():
-    data = request.json or {}
-    tid = data.get("id", "")
-    uid = int(data.get("uid", 0))
-    name = (data.get("name") or "").strip()
 
-    owner = get_owner(tid)
-    if uid != ADMIN_ID and uid != owner:
-        return jsonify({"ok": False, "message": "Access Denied"}), 403
-    if not name or ".." in name or name.startswith("/") or name.startswith("\\"):
-        return jsonify({"ok": False, "message": "Invalid name"}), 400
-
-    work_dir, _, _, _, _ = resolve_paths(tid)
-    target = os.path.join(work_dir, name)
-    if not within_dir(work_dir, target):
-        return jsonify({"ok": False, "message": "Security block"}), 400
-
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    if os.path.exists(target):
-        return jsonify({"ok": False, "message": "File already exists"}), 400
-
-    with open(target, "w", encoding="utf-8") as f:
-        f.write("")
-    return jsonify({"ok": True})
-
-# ---------- Env Vars UI (Feature 9) ----------
-ENV_HTML = """
-<!DOCTYPE html><html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Env Vars</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<style>
-body{margin:0;font-family:sans-serif;background:#0b0d10;color:#e8e8e8}
-.header{padding:10px;background:#161a20;position:sticky;top:0}
-.box{padding:10px}
-.row{display:flex;gap:8px;margin-bottom:8px}
-input{flex:1;padding:10px;border-radius:10px;border:0;background:#0f141d;color:#fff}
-button{padding:10px;border-radius:10px;border:0;background:#2b90ff;color:#fff;font-weight:700}
-.item{padding:10px;border-radius:10px;background:#131821;margin-bottom:8px;display:flex;justify-content:space-between;gap:10px;align-items:center}
-.k{font-weight:800}
-.small{opacity:.7;font-size:12px}
-</style>
-</head>
-<body>
-<div class="header">
-  <div class="small">Edit Env for {{tid_plain}}</div>
-  <div class="row">
-    <input id="k" placeholder="KEY">
-    <input id="v" placeholder="VALUE">
-    <button onclick="saveKV()">💾 Save</button>
-  </div>
-</div>
-<div class="box" id="list">Loading...</div>
-<script>
-var tg=window.Telegram.WebApp; tg.expand();
-async function loadEnv(){
-  const r = await fetch('/api/env?id={{tid}}&uid={{uid}}');
-  const j = await r.json();
-  if(!j.ok){ document.getElementById('list').textContent=j.message; return; }
-  const div=document.getElementById('list'); div.innerHTML='';
-  Object.keys(j.env).sort().forEach(k=>{
-    const item=document.createElement('div'); item.className='item';
-    const left=document.createElement('div');
-    left.innerHTML='<div class="k">'+k+'</div><div class="small">'+(j.env[k] ? '••••••' : '')+'</div>';
-    const btn=document.createElement('button');
-    btn.textContent='🗑️ Delete';
-    btn.onclick=()=>delK(k);
-    item.appendChild(left); item.appendChild(btn);
-    item.onclick=()=>{ document.getElementById('k').value=k; document.getElementById('v').value=j.env[k]; };
-    div.appendChild(item);
-  });
-}
-async function saveKV(){
-  const k=document.getElementById('k').value.trim();
-  const v=document.getElementById('v').value;
-  if(!k){ tg.showAlert('KEY required'); return; }
-  const r = await fetch('/api/env_save', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({id:'{{tid_plain}}', uid: {{uid}}, key:k, value:v})
-  });
-  const j=await r.json();
-  if(j.ok){ tg.showAlert('Saved'); loadEnv(); }
-  else tg.showAlert(j.message||'Failed');
-}
-async function delK(k){
-  const r = await fetch('/api/env_delete', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({id:'{{tid_plain}}', uid: {{uid}}, key:k})
-  });
-  const j=await r.json();
-  if(j.ok){ loadEnv(); } else tg.showAlert(j.message||'Failed');
-}
-loadEnv();
-</script>
-</body></html>
-"""
-
-def parse_env_file(env_path: str) -> dict:
-    out = {}
-    if not os.path.exists(env_path):
-        return out
-    with open(env_path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith("#") or "=" not in s:
-                continue
-            k, v = s.split("=", 1)
-            out[k.strip()] = v.strip()
-    return out
-
-def write_env_file(env_path: str, env: dict):
-    os.makedirs(os.path.dirname(env_path), exist_ok=True)
-    lines = []
-    for k in sorted(env.keys()):
-        lines.append(f"{k}={env[k]}")
-    with open(env_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
-@app.route("/env")
-def env_ui():
-    tid = request.args.get("id", "")
-    uid = int(request.args.get("uid", "0"))
-    owner = get_owner(tid)
-    if uid != ADMIN_ID and uid != owner:
-        return "⛔ Access Denied", 403
-    return render_template_string(ENV_HTML, tid=safe_q(tid), tid_plain=tid, uid=uid)
-
-@app.route("/api/env")
-def env_api():
-    tid = unquote(request.args.get("id", ""))
-    uid = int(request.args.get("uid", "0"))
-    owner = get_owner(tid)
-    if uid != ADMIN_ID and uid != owner:
-        return jsonify({"ok": False, "message": "Access Denied"}), 403
-    work_dir, _, env_path, _, _ = resolve_paths(tid)
-    if not os.path.exists(work_dir):
-        return jsonify({"ok": False, "message": "Workdir missing"}), 400
-    env = parse_env_file(env_path)
-    return jsonify({"ok": True, "env": env})
-
-@app.route("/api/env_save", methods=["POST"])
-def env_save_api():
-    data = request.json or {}
-    tid = data.get("id", "")
-    uid = int(data.get("uid", 0))
-    k = (data.get("key") or "").strip()
-    v = (data.get("value") or "").strip()
-    owner = get_owner(tid)
-    if uid != ADMIN_ID and uid != owner:
-        return jsonify({"ok": False, "message": "Access Denied"}), 403
-    if not k or any(c in k for c in [" ", "\n", "\r", "\t"]):
-        return jsonify({"ok": False, "message": "Invalid KEY"}), 400
-
-    work_dir, _, env_path, _, _ = resolve_paths(tid)
-    env = parse_env_file(env_path)
-    env[k] = v
-    write_env_file(env_path, env)
-    return jsonify({"ok": True})
-
-@app.route("/api/env_delete", methods=["POST"])
-def env_delete_api():
-    data = request.json or {}
-    tid = data.get("id", "")
-    uid = int(data.get("uid", 0))
-    k = (data.get("key") or "").strip()
-    owner = get_owner(tid)
-    if uid != ADMIN_ID and uid != owner:
-        return jsonify({"ok": False, "message": "Access Denied"}), 403
-    work_dir, _, env_path, _, _ = resolve_paths(tid)
-    env = parse_env_file(env_path)
-    if k in env:
-        del env[k]
-        write_env_file(env_path, env)
-    return jsonify({"ok": True})
-
-# ---------- Editor (single file, but now used with File Manager) ----------
-EDITOR_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Universal Editor</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/theme/dracula.min.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/python/python.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/javascript/javascript.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/shell/shell.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/dockerfile/dockerfile.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/properties/properties.min.js"></script>
-    <style>
-        body { margin: 0; padding: 0; background: #282a36; color: #f8f8f2; font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; }
-        .header { padding: 10px; background: #44475a; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #6272a4; }
-        .header h3 { margin: 0; font-size: 14px; color: #8be9fd; }
-        .btn { background: #50fa7b; color: #282a36; border: none; padding: 8px 15px; border-radius: 5px; font-weight: bold; cursor: pointer; }
-        .CodeMirror { flex-grow: 1; font-size: 13px; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h3>📄 {{ filename }}</h3>
-        <button class="btn" onclick="saveCode()">💾 Save & Restart</button>
-    </div>
-    <textarea id="code_area">{{ code }}</textarea>
-    <script>
-        var tg = window.Telegram.WebApp;
-        tg.expand(); 
-        
-        var fname = "{{ filename }}".toLowerCase();
-        var mode = "python";
-        if(fname.endsWith(".js") || fname.endsWith(".json")) mode = "javascript";
-        if(fname.endsWith(".sh")) mode = "shell";
-        if(fname.includes("dockerfile")) mode = "dockerfile";
-        if(fname.endsWith(".env") || fname.endsWith(".txt")) mode = "properties";
-
-        var editor = CodeMirror.fromTextArea(document.getElementById("code_area"), {
-            mode: mode, theme: "dracula", lineNumbers: true
-        });
-
-        function saveCode() {
-            fetch('/save_code', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ 
-                    target_id: "{{ target_id }}", 
-                    filename: "{{ filename }}",
-                    code: editor.getValue(),
-                    uid: {{uid}}
-                })
-            })
-            .then(r => r.json())
-            .then(data => {
-                if(data.status === 'success') {
-                    tg.showAlert("✅ Saved & Restarting...");
-                    tg.close();
-                } else {
-                    tg.showAlert("❌ Error: " + data.message);
-                }
-            });
-        }
-    </script>
-</body>
-</html>
-"""
-
-@app.route("/editor")
-def editor_page():
-    tid = request.args.get("id", "")
-    filename = request.args.get("file", "")
-    uid = int(request.args.get("uid", "0"))
-
-    owner = get_owner(tid)
-    if uid != ADMIN_ID and uid != owner:
-        return "⛔ Access Denied", 403
-
-    work_dir, _, _, _, _ = resolve_paths(tid)
-    file_path = os.path.join(work_dir, filename)
-
-    if not within_dir(work_dir, file_path):
-        return "⛔ Security Block.", 400
-
-    content = ""
-    if os.path.exists(file_path):
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-
-    return render_template_string(
-        EDITOR_HTML, code=content, target_id=safe_q(tid), filename=filename, uid=uid
-    )
-
-@app.route("/save_code", methods=["POST"])
-def save_code():
-    data = request.json or {}
-    tid = unquote(data.get("target_id", ""))
-    filename = data.get("filename", "")
-    code = data.get("code", "")
-    uid = int(data.get("uid", 0))
-
-    owner = get_owner(tid)
-    if uid != ADMIN_ID and uid != owner:
-        return jsonify({"status": "error", "message": "Access Denied"}), 403
-
-    work_dir, _, _, _, _ = resolve_paths(tid)
-    file_path = os.path.join(work_dir, filename)
-    if not within_dir(work_dir, file_path):
-        return jsonify({"status": "error", "message": "Security Block"}), 400
-
-    try:
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(code)
-
-        # smart install
-        if filename == "requirements.txt" or filename.endswith(".txt"):
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", file_path])
-        elif filename == "package.json":
-            subprocess.check_call(["npm", "install"], cwd=work_dir)
-
-        # restart app
-        restart_process_background(tid)
-        return jsonify({"status": "success"})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
-
-# ---------- Resource Stats API (Feature 3) ----------
-@app.route("/api/app_stats")
-def app_stats_api():
-    tid = request.args.get("id", "")
-    uid = int(request.args.get("uid", "0"))
-    owner = get_owner(tid)
-    if uid != ADMIN_ID and uid != owner:
-        return jsonify({"ok": False, "message": "Access Denied"}), 403
-
-    info = {"ok": True, "running": False, "cpu": 0.0, "ram_mb": 0.0, "uptime_s": 0}
-    if tid in running_processes:
-        p = running_processes[tid]["process"]
-        if p.poll() is None:
-            info["running"] = True
-            info["uptime_s"] = int(time.time() - running_processes[tid].get("started_at", time.time()))
-            try:
-                proc = psutil.Process(p.pid)
-                # cpu_percent needs warm-up; return current snapshot
-                info["cpu"] = float(proc.cpu_percent(interval=0.0))
-                info["ram_mb"] = float(proc.memory_info().rss / (1024 * 1024))
-            except Exception:
-                pass
-    return jsonify(info)
-
-# ================= RUN FLASK =================
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
-# ================= TELEGRAM BOT HANDLERS =================
+
+# ================= HEALTHCHECK + ALERTS (Feature F) =================
+async def send_alert(bot, chat_id: int, text: str):
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"Failed to send alert to {chat_id}: {e}")
+
+def can_alert(tid: str) -> bool:
+    meta = running_processes.get(tid, {})
+    last = meta.get("last_alert", 0)
+    return (time.time() - last) >= ALERT_COOLDOWN_SEC
+
+def mark_alerted(tid: str):
+    if tid in running_processes:
+        running_processes[tid]["last_alert"] = time.time()
+
+async def watchdog_loop(app_bot):
+    """
+    - If app stopped/crashed -> alert owner + admin and (optional) auto restart it (since you already have last_run)
+    - If high CPU/RAM -> alert (cooldown)
+    """
+    if not ENABLE_ALERTS:
+        logger.info("Alerts disabled (ENABLE_ALERTS!=1).")
+        return
+
+    logger.info("Watchdog started.")
+    while True:
+        try:
+            ownership = load_ownership()
+            # only watch apps that are marked last_run True
+            watch_list = [tid for tid, meta in ownership.items() if meta.get("last_run") is True]
+
+            for tid in watch_list:
+                # is it running?
+                rp = running_processes.get(tid)
+                is_running = False
+                pid = None
+                if rp and rp["process"].poll() is None:
+                    is_running = True
+                    pid = rp["process"].pid
+
+                # stopped/crashed
+                if not is_running:
+                    if can_alert(tid):
+                        owner_id = ownership.get(tid, {}).get("owner", ADMIN_ID)
+                        msg = (
+                            f"⚠️ App DOWN\n"
+                            f"App: {tid}\n"
+                            f"Owner: {owner_id}\n"
+                            f"Action: Restarting now..."
+                        )
+                        await send_alert(app_bot.bot, ADMIN_ID, msg)
+                        if owner_id and owner_id != ADMIN_ID:
+                            await send_alert(app_bot.bot, owner_id, msg)
+                        mark_alerted(tid)
+
+                    # auto-restart
+                    restart_process_background(tid)
+                    continue
+
+                # resource checks
+                try:
+                    proc = psutil.Process(pid)
+                    cpu = proc.cpu_percent(interval=0.0)
+                    ram_mb = proc.memory_info().rss / (1024 * 1024)
+
+                    if (cpu >= CPU_ALERT_PERCENT or ram_mb >= RAM_ALERT_MB) and can_alert(tid):
+                        owner_id = ownership.get(tid, {}).get("owner", ADMIN_ID)
+                        msg = (
+                            f"🚨 High Resource Usage\n"
+                            f"App: {tid}\n"
+                            f"CPU: {cpu:.2f}% (threshold {CPU_ALERT_PERCENT}%)\n"
+                            f"RAM: {ram_mb:.2f} MB (threshold {RAM_ALERT_MB} MB)"
+                        )
+                        await send_alert(app_bot.bot, ADMIN_ID, msg)
+                        if owner_id and owner_id != ADMIN_ID:
+                            await send_alert(app_bot.bot, owner_id, msg)
+                        mark_alerted(tid)
+
+                except Exception:
+                    pass
+
+        except Exception as e:
+            logger.error(f"Watchdog loop error: {e}")
+
+        await asyncio.sleep(HEALTHCHECK_INTERVAL_SEC)
+
+
+# ================= TELEGRAM FLOWS =================
 WAIT_FILE, WAIT_EXTRAS, WAIT_ENV_TEXT = range(3)
 WAIT_URL, WAIT_GIT_EXTRAS, WAIT_GIT_ENV_TEXT, WAIT_SELECT_FILE = range(3, 7)
 
 @restricted
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 **Mega Hosting Bot**", reply_markup=main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
+    await update.message.reply_text(
+        "👋 Mega Hosting Bot",
+        reply_markup=main_menu_keyboard(update.effective_user.id),
+    )
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚫 Cancelled.", reply_markup=main_menu_keyboard(update.effective_user.id))
     return ConversationHandler.END
 
-# ---- Upload flow ----
+# ---- Upload ----
 @restricted
 async def upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📤 Send file (.py, .js, .sh)", reply_markup=ReplyKeyboardMarkup([["🔙 Cancel"]], resize_keyboard=True))
+    await update.message.reply_text(
+        "📤 Send file (.py, .js, .sh)",
+        reply_markup=ReplyKeyboardMarkup([["🔙 Cancel"]], resize_keyboard=True),
+    )
     return WAIT_FILE
 
 async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -966,7 +641,6 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid type. Only .py/.js/.sh")
         return WAIT_FILE
 
-    # per-user folder (no overwrite)
     user_dir = os.path.join(UPLOAD_DIR, str(uid))
     os.makedirs(user_dir, exist_ok=True)
 
@@ -976,14 +650,17 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     unique_id = f"u{uid}|{fname}"
     key = secrets.token_urlsafe(16)
 
-    save_ownership_record(unique_id, {
-        "owner": uid,
-        "type": "file",
-        "key": key,
-        "last_run": False,
-        "entry": fname,  # for user-file, entry is filename
-        "created_at": int(time.time()),
-    })
+    save_ownership_record(
+        unique_id,
+        {
+            "owner": uid,
+            "type": "file",
+            "key": key,
+            "last_run": False,
+            "entry": fname,
+            "created_at": int(time.time()),
+        },
+    )
 
     context.user_data.update({"type": "file", "target_id": unique_id, "work_dir": user_dir})
     await update.message.reply_text("✅ Saved.", reply_markup=extras_keyboard())
@@ -998,7 +675,10 @@ async def receive_extras(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await cancel(update, context)
 
     if txt == "📝 Type Env Vars":
-        await update.message.reply_text("📝 Type env lines (KEY=VALUE).", reply_markup=ReplyKeyboardMarkup([["🔙 Cancel"]], resize_keyboard=True))
+        await update.message.reply_text(
+            "📝 Type env lines (KEY=VALUE).",
+            reply_markup=ReplyKeyboardMarkup([["🔙 Cancel"]], resize_keyboard=True),
+        )
         return WAIT_ENV_TEXT
 
     if txt == "➕ Add Deps":
@@ -1086,10 +766,14 @@ async def receive_extra_files(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("Next?", reply_markup=extras_keyboard())
     return WAIT_EXTRAS
 
-# ---- Git flow ----
+
+# ---- Git ----
 @restricted
 async def git_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🌐 Send Git URL", reply_markup=ReplyKeyboardMarkup([["🔙 Cancel"]], resize_keyboard=True))
+    await update.message.reply_text(
+        "🌐 Send Git URL",
+        reply_markup=ReplyKeyboardMarkup([["🔙 Cancel"]], resize_keyboard=True),
+    )
     return WAIT_URL
 
 async def receive_git_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1109,17 +793,13 @@ async def receive_git_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         subprocess.check_call(["git", "clone", url, repo_path])
         await install_dependencies(repo_path, update)
 
-        # create record now; entry chosen later by selection (or auto-detect)
+        # placeholder record
         tid = f"{repo_name}|PLACEHOLDER"
         key = secrets.token_urlsafe(16)
-        save_ownership_record(tid, {
-            "owner": uid,
-            "type": "repo",
-            "key": key,
-            "last_run": False,
-            "entry": None,
-            "created_at": int(time.time()),
-        })
+        save_ownership_record(
+            tid,
+            {"owner": uid, "type": "repo", "key": key, "last_run": False, "entry": None, "created_at": int(time.time())},
+        )
 
         context.user_data.update({"repo_path": repo_path, "repo_name": repo_name, "target_id": tid, "type": "repo", "work_dir": repo_path})
         await update.message.reply_text("⚙️ Setup done. Now select file to run.", reply_markup=git_extras_keyboard())
@@ -1145,11 +825,7 @@ async def show_file_selection(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ Repo not found.")
         return ConversationHandler.END
 
-    files = []
-    for f in list_files_safe(repo_path):
-        if f.endswith((".py", ".js", ".sh")):
-            files.append(f)
-
+    files = [f for f in list_files_safe(repo_path) if f.endswith((".py", ".js", ".sh"))]
     if not files:
         await update.message.reply_text("❌ No runnable files found.")
         return ConversationHandler.END
@@ -1164,8 +840,7 @@ async def select_git_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     filename = q.data.split("sel_run_")[1]
 
     repo_name = context.user_data.get("repo_name")
-    # replace placeholder record with real tid
-    old_tid = context.user_data.get("target_id")  # repo|PLACEHOLDER
+    old_tid = context.user_data.get("target_id")
     new_tid = f"{repo_name}|{filename}"
 
     data = load_ownership()
@@ -1176,21 +851,17 @@ async def select_git_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del data[old_tid]
         _write_json(OWNERSHIP_FILE, data)
     else:
-        # fallback: create
-        save_ownership_record(new_tid, {
-            "owner": update.effective_user.id,
-            "type": "repo",
-            "key": secrets.token_urlsafe(16),
-            "last_run": False,
-            "entry": filename,
-            "created_at": int(time.time()),
-        })
+        save_ownership_record(
+            new_tid,
+            {"owner": update.effective_user.id, "type": "repo", "key": secrets.token_urlsafe(16), "last_run": False, "entry": filename, "created_at": int(time.time())},
+        )
 
     context.user_data["target_id"] = new_tid
     await q.edit_message_text(f"✅ Selected `{filename}`", parse_mode="Markdown")
     return await execute_logic(q, context)
 
-# ---- Execute (launch) ----
+
+# ---- Execute ----
 async def execute_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_func = update.message.reply_text if getattr(update, "message", None) else update.callback_query.message.reply_text
     tid = context.user_data.get("target_id", context.user_data.get("fallback_id"))
@@ -1202,12 +873,11 @@ async def execute_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = get_app_key(tid) or "no-key"
 
     await msg_func(
-        "🚀 **Launched!**\n"
-        f"🔒 **Secure URL:** `{safe_status_url(tid, key)}`",
-        parse_mode="Markdown",
+        "🚀 Launched!\n" f"🔒 Secure URL:\n{safe_status_url(tid, key)}",
         reply_markup=main_menu_keyboard(update.effective_user.id),
     )
     return ConversationHandler.END
+
 
 # ---- List & Manage ----
 @restricted
@@ -1238,11 +908,11 @@ def app_manage_buttons(tid: str, uid: int):
     key = get_app_key(tid) or ""
     status = "🟢 Running" if is_running else "🔴 Stopped"
 
-    text = f"⚙️ **App:** `{tid}`\nStatus: {status}"
+    text = f"⚙️ App: {tid}\nStatus: {status}"
     if uid == ADMIN_ID:
-        text += f"\n👤 **Owner:** `{owner}`"
+        text += f"\nOwner: {owner}"
     if key:
-        text += f"\n🔒 **Secure URL:** `{safe_status_url(tid, key)}`"
+        text += f"\nSecure URL:\n{safe_status_url(tid, key)}"
 
     btns = []
     row1 = []
@@ -1251,20 +921,11 @@ def app_manage_buttons(tid: str, uid: int):
     row1.append(InlineKeyboardButton("🚀 Run/Restart", callback_data=f"rerun_{tid}"))
     btns.append(row1)
 
-    # web UIs
     btns.append([
         InlineKeyboardButton("📜 Logs (Web)", web_app=WebAppInfo(url=f"{BASE_URL}/logs?id={safe_q(tid)}&uid={uid}&lines=250")),
-        InlineKeyboardButton("📁 Files", web_app=WebAppInfo(url=f"{BASE_URL}/files?id={safe_q(tid)}&uid={uid}")),
-    ])
-    btns.append([
-        InlineKeyboardButton("🔑 Env Vars", web_app=WebAppInfo(url=f"{BASE_URL}/env?id={safe_q(tid)}&uid={uid}")),
-        InlineKeyboardButton("📊 Stats", callback_data=f"stats_{tid}"),
-    ])
-
-    btns.append([
         InlineKeyboardButton("🧹 Clear Logs", callback_data=f"clrlog_{tid}"),
-        InlineKeyboardButton("🗑️ Delete", callback_data=f"del_{tid}"),
     ])
+    btns.append([InlineKeyboardButton("🗑️ Delete", callback_data=f"del_{tid}")])
     return text, InlineKeyboardMarkup(btns)
 
 async def manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1278,9 +939,8 @@ async def manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         owner = get_owner(tid)
         if uid != ADMIN_ID and uid != owner:
             return await q.message.reply_text("⛔ Not yours.")
-
         text, markup = app_manage_buttons(tid, uid)
-        return await q.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+        return await q.edit_message_text(text, reply_markup=markup)
 
     if data.startswith("stop_"):
         tid = data.split("stop_")[1]
@@ -1288,7 +948,7 @@ async def manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if uid != ADMIN_ID and uid != owner:
             return await q.message.reply_text("⛔ Not yours.")
         stop_process(tid)
-        return await q.edit_message_text(f"🛑 Stopped `{tid}`", parse_mode="Markdown")
+        return await q.edit_message_text(f"🛑 Stopped: {tid}")
 
     if data.startswith("rerun_"):
         tid = data.split("rerun_")[1]
@@ -1307,26 +967,6 @@ async def manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_log(tid)
         return await q.message.reply_text("✅ Logs cleared.")
 
-    if data.startswith("stats_"):
-        tid = data.split("stats_")[1]
-        owner = get_owner(tid)
-        if uid != ADMIN_ID and uid != owner:
-            return await q.message.reply_text("⛔ Not yours.")
-        # compute stats
-        resp = app.test_client().get(f"/api/app_stats?id={safe_q(tid)}&uid={uid}")
-        j = resp.get_json() if resp.is_json else {}
-        if not j.get("ok"):
-            return await q.message.reply_text("❌ Could not fetch stats.")
-        if not j.get("running"):
-            return await q.message.reply_text("🔴 App is not running.")
-        return await q.message.reply_text(
-            f"📊 **Stats for** `{tid}`\n"
-            f"CPU: `{j.get('cpu', 0):.2f}%`\n"
-            f"RAM: `{j.get('ram_mb', 0):.2f} MB`\n"
-            f"Uptime: `{j.get('uptime_s', 0)}s`",
-            parse_mode="Markdown"
-        )
-
     if data.startswith("del_"):
         tid = data.split("del_")[1]
         owner = get_owner(tid)
@@ -1337,7 +977,6 @@ async def manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         delete_ownership(tid)
 
         work_dir, script_path, _, _, _ = resolve_paths(tid)
-        # delete file/folder safely
         if is_repo_id(tid):
             shutil.rmtree(work_dir, ignore_errors=True)
         elif is_user_file_id(tid):
@@ -1350,78 +989,103 @@ async def manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(os.path.join(UPLOAD_DIR, tid))
             except Exception:
                 pass
-        return await q.edit_message_text(f"🗑️ Deleted `{tid}`", parse_mode="Markdown")
+
+        return await q.edit_message_text(f"🗑️ Deleted: {tid}")
+
 
 # ---- Server Stats ----
 @restricted
 async def server_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # light stats
     total = len(load_ownership())
     running = sum(1 for tid in running_processes if running_processes[tid]["process"].poll() is None)
     await update.message.reply_text(f"📊 Apps: {total}\n🟢 Running: {running}")
 
-# ---- Admin Panel (Feature 4) ----
-@restricted
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return await update.message.reply_text("⛔ Admin only.")
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛑 Stop ALL", callback_data="admin_stop_all"),
-         InlineKeyboardButton("🔄 Restart ALL last-run", callback_data="admin_restart_all")],
-        [InlineKeyboardButton("🧹 Clear ALL logs", callback_data="admin_clear_logs")],
-    ])
-    await update.message.reply_text("🛠 Admin Panel", reply_markup=kb)
 
-async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================= OWNER PANEL (what you asked) =================
+@restricted
+async def owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return await update.message.reply_text("⛔ Owner only.")
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 View Access List", callback_data="own_access")],
+        [InlineKeyboardButton("🧾 View Apps & Owners", callback_data="own_apps")],
+        [InlineKeyboardButton("🟢 View Running", callback_data="own_running"),
+         InlineKeyboardButton("🔴 View Down", callback_data="own_down")],
+        [InlineKeyboardButton("🛑 Stop ALL", callback_data="own_stop_all"),
+         InlineKeyboardButton("🔄 Restart ALL last-run", callback_data="own_restart_all")],
+    ])
+    await update.message.reply_text("🛠 Owner Panel", reply_markup=kb)
+
+async def owner_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     if update.effective_user.id != ADMIN_ID:
-        return await q.message.reply_text("⛔ Admin only.")
+        return await q.message.reply_text("⛔ Owner only.")
 
-    if q.data == "admin_stop_all":
+    ownership = load_ownership()
+
+    if q.data == "own_access":
+        allowed = get_allowed_users()
+        text = "👥 **Access List**\n"
+        text += f"- Owner (ADMIN_ID): `{ADMIN_ID}`\n"
+        if allowed:
+            text += "- Allowed users:\n" + "\n".join([f"  • `{u}`" for u in allowed])
+        else:
+            text += "- Allowed users: *(none)*"
+        return await q.message.reply_text(text, parse_mode="Markdown")
+
+    if q.data == "own_apps":
+        if not ownership:
+            return await q.message.reply_text("No apps.")
+        lines = ["🧾 **Apps & Owners**"]
+        for tid, meta in ownership.items():
+            lines.append(f"• `{tid}`  → 👤 `{meta.get('owner')}`  | last_run={meta.get('last_run')}")
+        return await q.message.reply_text("\n".join(lines[:80]), parse_mode="Markdown")
+
+    if q.data == "own_running":
+        lines = ["🟢 **Running Apps**"]
+        any_ = False
+        for tid in ownership.keys():
+            ok = tid in running_processes and running_processes[tid]["process"].poll() is None
+            if ok:
+                any_ = True
+                lines.append(f"• `{tid}`")
+        if not any_:
+            lines.append("_None_")
+        return await q.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    if q.data == "own_down":
+        lines = ["🔴 **Down Apps** (last_run=True but not running)"]
+        any_ = False
+        for tid, meta in ownership.items():
+            if meta.get("last_run") is True:
+                ok = tid in running_processes and running_processes[tid]["process"].poll() is None
+                if not ok:
+                    any_ = True
+                    lines.append(f"• `{tid}`")
+        if not any_:
+            lines.append("_None_")
+        return await q.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    if q.data == "own_stop_all":
         for tid in list(running_processes.keys()):
             stop_process(tid)
-        return await q.edit_message_text("🛑 Stopped all running apps.")
+        return await q.message.reply_text("🛑 Stopped all running apps.")
 
-    if q.data == "admin_restart_all":
-        # start only last_run True
+    if q.data == "own_restart_all":
         auto_start_last_run_apps()
-        return await q.edit_message_text("🔄 Restart requested for last-run apps.")
+        return await q.message.reply_text("🔄 Restart requested for last-run apps.")
 
-    if q.data == "admin_clear_logs":
-        for tid in load_ownership().keys():
-            clear_log(tid)
-        return await q.edit_message_text("🧹 Cleared logs for all apps.")
 
 # ---- Help ----
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🆘 **Help**\n"
-        "- Upload a file or clone repo\n"
-        "- Run app and get secure status URL\n"
-        "- Manage: Logs/Files/Env/Stats\n"
-        "Contact: @platoonleaderr",
-        parse_mode="Markdown",
-    )
+    await update.message.reply_text("🆘 Help\nContact: @platoonleaderr")
 
-# ---- Admin allowlist commands ----
-@super_admin_only
-async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("Usage: /add <user_id>")
-    if save_allowed_user(int(context.args[0])):
-        await update.message.reply_text("✅ Added.")
-
-@super_admin_only
-async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("Usage: /remove <user_id>")
-    if remove_allowed_user(int(context.args[0])):
-        await update.message.reply_text("🗑️ Removed.")
 
 # ================= MAIN =================
 if __name__ == "__main__":
-    # start Flask (Render Web Service)
+    # start Flask
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
 
@@ -1429,13 +1093,19 @@ if __name__ == "__main__":
         print("❌ ERROR: TOKEN env var not set")
         sys.exit(1)
 
-    # Feature 1: Auto-start last-run apps on boot
+    # auto-start apps
     try:
         auto_start_last_run_apps()
     except Exception as e:
         logger.error(f"Auto-start on boot failed: {e}")
 
     app_bot = ApplicationBuilder().token(TOKEN).build()
+
+    # start watchdog/alerts (Feature F)
+    try:
+        app_bot.create_task(watchdog_loop(app_bot))
+    except Exception as e:
+        logger.error(f"Watchdog start failed: {e}")
 
     conv_file = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📤 Upload File$"), upload_start)],
@@ -1480,18 +1150,16 @@ if __name__ == "__main__":
     )
 
     app_bot.add_handler(CommandHandler("start", start))
-    app_bot.add_handler(CommandHandler("add", add_user))
-    app_bot.add_handler(CommandHandler("remove", remove_user))
-
     app_bot.add_handler(conv_file)
     app_bot.add_handler(conv_git)
 
     app_bot.add_handler(MessageHandler(filters.Regex("^📂 My Hosted Apps$"), list_hosted))
     app_bot.add_handler(MessageHandler(filters.Regex("^📊 Server Stats$"), server_stats))
     app_bot.add_handler(MessageHandler(filters.Regex("^🆘 Help$"), help_command))
-    app_bot.add_handler(MessageHandler(filters.Regex("^🛠 Admin Panel$"), admin_panel))
+    app_bot.add_handler(MessageHandler(filters.Regex("^🛠 Owner Panel$"), owner_panel))
 
-    app_bot.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
+    app_bot.add_handler(CallbackQueryHandler(owner_panel_callback, pattern="^own_"))
     app_bot.add_handler(CallbackQueryHandler(manage_callback))
+
     print("Bot is up and running!")
     app_bot.run_polling()
